@@ -75,12 +75,34 @@ func createAuthOAuth1Cmd(auth *auth.Auth) *cobra.Command {
 		Use:   "oauth1",
 		Short: "Configure OAuth1 authentication",
 		Run: func(cmd *cobra.Command, args []string) {
-			err := auth.TokenStore.SaveOAuth1Tokens(accessToken, tokenSecret, consumerKey, consumerSecret)
+			hasAccessToken := cmd.Flags().Changed("access-token")
+			hasTokenSecret := cmd.Flags().Changed("token-secret")
+			hasConsumerKey := cmd.Flags().Changed("consumer-key")
+			hasConsumerSecret := cmd.Flags().Changed("consumer-secret")
+
+			// If all 4 flags provided, save directly (original behavior)
+			if hasAccessToken && hasTokenSecret && hasConsumerKey && hasConsumerSecret {
+				err := auth.TokenStore.SaveOAuth1Tokens(accessToken, tokenSecret, consumerKey, consumerSecret)
+				if err != nil {
+					fmt.Println("Error saving OAuth1 tokens:", err)
+					os.Exit(1)
+				}
+				fmt.Printf("\033[32mOAuth1 credentials saved successfully!\033[0m\n")
+				return
+			}
+
+			// If only consumer key/secret provided via flags, use them for interactive flow
+			if hasConsumerKey && hasConsumerSecret {
+				auth.SetConsumerCredentials(consumerKey, consumerSecret)
+			}
+
+			// Run the 3-legged OAuth1 flow (uses flags or env vars for consumer credentials)
+			err := auth.OAuth1Flow()
 			if err != nil {
-				fmt.Println("Error saving OAuth1 tokens:", err)
+				fmt.Println("OAuth1 authentication failed:", err)
 				os.Exit(1)
 			}
-			fmt.Printf("\033[32mOAuth1 credentials saved successfully!\033[0m\n")
+			fmt.Printf("\033[32mOAuth1 authentication successful!\033[0m\n")
 		},
 	}
 
@@ -88,11 +110,6 @@ func createAuthOAuth1Cmd(auth *auth.Auth) *cobra.Command {
 	cmd.Flags().StringVar(&consumerSecret, "consumer-secret", "", "Consumer secret for OAuth1")
 	cmd.Flags().StringVar(&accessToken, "access-token", "", "Access token for OAuth1")
 	cmd.Flags().StringVar(&tokenSecret, "token-secret", "", "Token secret for OAuth1")
-
-	cmd.MarkFlagRequired("consumer-key")
-	cmd.MarkFlagRequired("consumer-secret")
-	cmd.MarkFlagRequired("access-token")
-	cmd.MarkFlagRequired("token-secret")
 
 	return cmd
 }

@@ -5,7 +5,8 @@ A command-line tool for interacting with the X (formerly Twitter) API, supportin
 ## Features
 
 - OAuth 2.0 PKCE flow authentication
-- OAuth 1.0a authentication
+- OAuth 1.0a 3-legged authorization flow
+- OAuth 1.0a manual token configuration
 - Multiple OAuth 2.0 account support
 - Persistent token storage
 - HTTP request customization (headers, methods, body)
@@ -43,7 +44,27 @@ export CLIENT_SECRET=your_client_secret
 ```bash
 xurl auth oauth2
 ```
-#### OAuth 1.0a authentication:
+#### OAuth 1.0a User-Context
+
+**Interactive flow (recommended):** Set your consumer credentials and run the interactive 3-legged flow. This will open your browser for authorization and automatically capture the access token via callback.
+
+1. Set the consumer key and secret in your environment variables.
+```env
+export CONSUMER_KEY=your_consumer_key
+export CONSUMER_SECRET=your_consumer_secret
+```
+2. Set the callback URL to `http://localhost:8080/callback` in your app's authentication settings in the [X API developer portal](https://developer.x.com/en/portal/dashboard).
+3. Get your access keys:
+```bash
+xurl auth oauth1
+```
+
+You can also pass consumer credentials directly via flags:
+```bash
+xurl auth oauth1 --consumer-key KEY --consumer-secret SECRET
+```
+
+**Manual token entry:** If you already have your access token and secret, you can provide all four values directly:
 ```bash
 xurl auth oauth1 --consumer-key KEY --consumer-secret SECRET --access-token TOKEN --token-secret SECRET
 ```

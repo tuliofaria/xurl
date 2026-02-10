@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -146,4 +148,165 @@ func TestGetOAuth2Scopes(t *testing.T) {
 	// Check for some common scopes
 	assert.Contains(t, scopes, "tweet.read", "Expected 'tweet.read' scope")
 	assert.Contains(t, scopes, "users.read", "Expected 'users.read' scope")
+}
+
+func TestBuildOAuth1AuthHeaderWithToken(t *testing.T) {
+	header, err := buildOAuth1AuthHeader(
+		"GET",
+		"https://api.x.com/2/users/me",
+		"consumer-key",
+		"consumer-secret",
+		"access-token",
+		"token-secret",
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Contains(t, header, "OAuth ")
+	assert.Contains(t, header, "oauth_consumer_key=\"consumer-key\"")
+	assert.Contains(t, header, "oauth_token=\"access-token\"")
+	assert.Contains(t, header, "oauth_signature_method=\"HMAC-SHA1\"")
+	assert.Contains(t, header, "oauth_version=\"1.0\"")
+	assert.Contains(t, header, "oauth_signature=")
+	assert.Contains(t, header, "oauth_nonce=")
+	assert.Contains(t, header, "oauth_timestamp=")
+}
+
+func TestBuildOAuth1AuthHeaderWithoutToken(t *testing.T) {
+	header, err := buildOAuth1AuthHeader(
+		"POST",
+		"https://api.x.com/oauth/request_token",
+		"consumer-key",
+		"consumer-secret",
+		"",
+		"",
+		map[string]string{
+			"oauth_callback": "http://localhost:8080/callback",
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Contains(t, header, "OAuth ")
+	assert.Contains(t, header, "oauth_consumer_key=\"consumer-key\"")
+	assert.NotContains(t, header, "oauth_token=")
+	assert.Contains(t, header, "oauth_callback=")
+	assert.Contains(t, header, "oauth_signature=")
+}
+
+func TestSetConsumerCredentials(t *testing.T) {
+	cfg := &config.Config{}
+	a := NewAuth(cfg)
+
+	a.SetConsumerCredentials("my-key", "my-secret")
+	assert.Equal(t, "my-key", a.consumerKey)
+	assert.Equal(t, "my-secret", a.consumerSecret)
+}
+
+func TestStartListenerDoesNotPanic(t *testing.T) {
+	// Verify that StartListener uses a new mux and doesn't panic
+	// when called multiple times (the DefaultServeMux bug fix)
+	done := make(chan error, 1)
+
+	go func() {
+		err := StartListener(18931, func(code, state string) error {
+			return nil
+		})
+		done <- err
+	}()
+
+	// Give the server a moment to start, then make a request to unblock it
+	<-time.After(100 * time.Millisecond)
+
+	resp, err := http.Get("http://127.0.0.1:18931/callback?code=test&state=test")
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartListener timed out")
+	}
+
+	// Call it again - this would panic with DefaultServeMux
+	go func() {
+		err := StartListener(18931, func(code, state string) error {
+			return nil
+		})
+		done <- err
+	}()
+
+	<-time.After(100 * time.Millisecond)
+
+	resp, err = http.Get("http://127.0.0.1:18931/callback?code=test2&state=test2")
+	if err == nil {
+		resp.Body.Close()
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Second StartListener call timed out")
+	}
+}
+
+func TestStartOAuth1Listener(t *testing.T) {
+	done := make(chan error, 1)
+	resultChan := make(chan [2]string, 1)
+	ready := make(chan struct{})
+
+	go func() {
+		err := StartOAuth1Listener(18932, func(oauthToken, oauthVerifier string) error {
+			resultChan <- [2]string{oauthToken, oauthVerifier}
+			return nil
+		}, ready)
+		done <- err
+	}()
+
+	<-ready
+
+	resp, err := http.Get("http://127.0.0.1:18932/callback?oauth_token=req-token&oauth_verifier=verifier-123")
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	select {
+	case result := <-resultChan:
+		assert.Equal(t, "req-token", result[0])
+		assert.Equal(t, "verifier-123", result[1])
+	case <-time.After(2 * time.Second):
+		t.Fatal("OAuth1 listener did not receive callback")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartOAuth1Listener timed out")
+	}
+}
+
+func TestStartOAuth1ListenerDenied(t *testing.T) {
+	done := make(chan error, 1)
+	ready := make(chan struct{})
+
+	go func() {
+		err := StartOAuth1Listener(18933, func(oauthToken, oauthVerifier string) error {
+			t.Fatal("Callback should not be called when authorization is denied")
+			return nil
+		}, ready)
+		done <- err
+	}()
+
+	<-ready
+
+	resp, err := http.Get("http://127.0.0.1:18933/callback?denied=some-token")
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	select {
+	case err := <-done:
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "denied")
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartOAuth1Listener did not return after denied")
+	}
 }

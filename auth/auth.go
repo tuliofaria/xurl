@@ -29,25 +29,35 @@ import (
 )
 
 type Auth struct {
-	TokenStore   *store.TokenStore
-	infoURL      string
-	clientID     string
-	clientSecret string
-	authURL      string
-	tokenURL     string
-	redirectURI  string
+	TokenStore           *store.TokenStore
+	infoURL              string
+	clientID             string
+	clientSecret         string
+	authURL              string
+	tokenURL             string
+	redirectURI          string
+	consumerKey          string
+	consumerSecret       string
+	oauth1RequestTokenURL string
+	oauth1AuthorizeURL   string
+	oauth1AccessTokenURL string
 }
 
 // NewAuth creates a new Auth object
 func NewAuth(config *config.Config) *Auth {
 	return &Auth{
-		TokenStore:   store.NewTokenStore(),
-		infoURL:      config.InfoURL,
-		clientID:     config.ClientID,
-		clientSecret: config.ClientSecret,
-		authURL:      config.AuthURL,
-		tokenURL:     config.TokenURL,
-		redirectURI:  config.RedirectURI,
+		TokenStore:           store.NewTokenStore(),
+		infoURL:              config.InfoURL,
+		clientID:             config.ClientID,
+		clientSecret:         config.ClientSecret,
+		authURL:              config.AuthURL,
+		tokenURL:             config.TokenURL,
+		redirectURI:          config.RedirectURI,
+		consumerKey:          config.ConsumerKey,
+		consumerSecret:       config.ConsumerSecret,
+		oauth1RequestTokenURL: config.OAuth1RequestTokenURL,
+		oauth1AuthorizeURL:   config.OAuth1AuthorizeURL,
+		oauth1AccessTokenURL: config.OAuth1AccessTokenURL,
 	}
 }
 
@@ -57,7 +67,13 @@ func (a *Auth) WithTokenStore(tokenStore *store.TokenStore) *Auth {
 	return a
 }
 
-// GetOAuth1Header gets the OAuth1 header for a request
+// SetConsumerCredentials sets consumer key and secret for OAuth1 flow (used by CLI flag overrides)
+func (a *Auth) SetConsumerCredentials(consumerKey, consumerSecret string) {
+	a.consumerKey = consumerKey
+	a.consumerSecret = consumerSecret
+}
+
+// GetOAuth1Header gets the OAuth1 header for a request using stored tokens
 func (a *Auth) GetOAuth1Header(method, urlStr string, additionalParams map[string]string) (string, error) {
 	token := a.TokenStore.GetOAuth1Tokens()
 	if token == nil || token.OAuth1 == nil {
@@ -65,7 +81,13 @@ func (a *Auth) GetOAuth1Header(method, urlStr string, additionalParams map[strin
 	}
 
 	oauth1Token := token.OAuth1
+	return buildOAuth1AuthHeader(method, urlStr, oauth1Token.ConsumerKey, oauth1Token.ConsumerSecret, oauth1Token.AccessToken, oauth1Token.TokenSecret, additionalParams)
+}
 
+// buildOAuth1AuthHeader builds an OAuth1 Authorization header with explicit credentials.
+// When oauthToken is empty, the oauth_token parameter is omitted from the header (used for request token step).
+// Any additional params (like oauth_callback) are included in signing and in the header if they start with "oauth_".
+func buildOAuth1AuthHeader(method, urlStr, consumerKey, consumerSecret, oauthToken, tokenSecret string, additionalParams map[string]string) (string, error) {
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
 		return "", xurlErrors.NewAuthError("InvalidURL", err)
@@ -82,26 +104,37 @@ func (a *Auth) GetOAuth1Header(method, urlStr string, additionalParams map[strin
 		params[key] = value
 	}
 
-	params["oauth_consumer_key"] = oauth1Token.ConsumerKey
+	params["oauth_consumer_key"] = consumerKey
 	params["oauth_nonce"] = generateNonce()
 	params["oauth_signature_method"] = "HMAC-SHA1"
 	params["oauth_timestamp"] = generateTimestamp()
-	params["oauth_token"] = oauth1Token.AccessToken
+	if oauthToken != "" {
+		params["oauth_token"] = oauthToken
+	}
 	params["oauth_version"] = "1.0"
 
-	signature, err := generateSignature(method, urlStr, params, oauth1Token.ConsumerSecret, oauth1Token.TokenSecret)
+	signature, err := generateSignature(method, urlStr, params, consumerSecret, tokenSecret)
 	if err != nil {
 		return "", xurlErrors.NewAuthError("SignatureGenerationError", err)
 	}
 
 	var oauthParams []string
-	oauthParams = append(oauthParams, fmt.Sprintf("oauth_consumer_key=\"%s\"", encode(oauth1Token.ConsumerKey)))
+	oauthParams = append(oauthParams, fmt.Sprintf("oauth_consumer_key=\"%s\"", encode(consumerKey)))
 	oauthParams = append(oauthParams, fmt.Sprintf("oauth_nonce=\"%s\"", encode(params["oauth_nonce"])))
 	oauthParams = append(oauthParams, fmt.Sprintf("oauth_signature=\"%s\"", encode(signature)))
 	oauthParams = append(oauthParams, fmt.Sprintf("oauth_signature_method=\"%s\"", encode("HMAC-SHA1")))
 	oauthParams = append(oauthParams, fmt.Sprintf("oauth_timestamp=\"%s\"", encode(params["oauth_timestamp"])))
-	oauthParams = append(oauthParams, fmt.Sprintf("oauth_token=\"%s\"", encode(oauth1Token.AccessToken)))
+	if oauthToken != "" {
+		oauthParams = append(oauthParams, fmt.Sprintf("oauth_token=\"%s\"", encode(oauthToken)))
+	}
 	oauthParams = append(oauthParams, fmt.Sprintf("oauth_version=\"%s\"", encode("1.0")))
+
+	// Include additional oauth_ params (like oauth_callback) in the header
+	for key, value := range additionalParams {
+		if strings.HasPrefix(key, "oauth_") {
+			oauthParams = append(oauthParams, fmt.Sprintf("%s=\"%s\"", key, encode(value)))
+		}
+	}
 
 	return "OAuth " + strings.Join(oauthParams, ", "), nil
 }
@@ -326,6 +359,163 @@ func (a *Auth) fetchUsername(accessToken string) (string, error) {
 	}
 
 	return "", xurlErrors.NewAuthError("UsernameNotFound", errors.New("username not found when fetching username"))
+}
+
+// OAuth1Flow runs the 3-legged OAuth1.0a authorization flow
+func (a *Auth) OAuth1Flow() error {
+	consumerKey := a.consumerKey
+	consumerSecret := a.consumerSecret
+
+	if consumerKey == "" || consumerSecret == "" {
+		return xurlErrors.NewAuthError("MissingCredentials", errors.New("consumer key and consumer secret are required"))
+	}
+
+	callbackURL := a.redirectURI
+
+	// Step 1: Get request token
+	additionalParams := map[string]string{
+		"oauth_callback": callbackURL,
+	}
+
+	authHeader, err := buildOAuth1AuthHeader("POST", a.oauth1RequestTokenURL, consumerKey, consumerSecret, "", "", additionalParams)
+	if err != nil {
+		return xurlErrors.NewAuthError("RequestTokenError", err)
+	}
+
+	req, err := http.NewRequest("POST", a.oauth1RequestTokenURL, nil)
+	if err != nil {
+		return xurlErrors.NewAuthError("RequestTokenError", err)
+	}
+	req.Header.Set("Authorization", authHeader)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return xurlErrors.NewAuthError("RequestTokenError", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return xurlErrors.NewAuthError("RequestTokenError", fmt.Errorf("request token failed with status %d: %s", resp.StatusCode, string(body)))
+	}
+
+	values, err := parseFormEncodedBody(resp)
+	if err != nil {
+		return xurlErrors.NewAuthError("RequestTokenError", err)
+	}
+
+	requestToken := values.Get("oauth_token")
+	requestTokenSecret := values.Get("oauth_token_secret")
+
+	if requestToken == "" || requestTokenSecret == "" {
+		return xurlErrors.NewAuthError("RequestTokenError", errors.New("missing oauth_token or oauth_token_secret in response"))
+	}
+
+	// Step 2: Start listener before opening browser
+	verifierChan := make(chan [2]string, 1)
+
+	callback := func(oauthToken, oauthVerifier string) error {
+		if oauthToken == "" || oauthVerifier == "" {
+			return xurlErrors.NewAuthError("InvalidCallback", errors.New("missing oauth_token or oauth_verifier"))
+		}
+		verifierChan <- [2]string{oauthToken, oauthVerifier}
+		return nil
+	}
+
+	parsedURL, err := url.Parse(callbackURL)
+	if err != nil {
+		return xurlErrors.NewAuthError("InvalidCallbackURL", err)
+	}
+
+	port := 8080
+	if parsedURL.Port() != "" {
+		fmt.Sscanf(parsedURL.Port(), "%d", &port)
+	}
+
+	listenerReady := make(chan struct{})
+	go func() {
+		if err := StartOAuth1Listener(port, callback, listenerReady); err != nil {
+			fmt.Printf("Error in OAuth1 listener: %v\n", err)
+		}
+	}()
+
+	// Wait for listener to be ready before opening browser
+	<-listenerReady
+
+	// Step 3: Direct user to authorize
+	authorizeURL := fmt.Sprintf("%s?oauth_token=%s", a.oauth1AuthorizeURL, encode(requestToken))
+
+	err = openBrowser(authorizeURL)
+	if err != nil {
+		fmt.Println("Failed to open browser automatically. Please visit this URL manually:")
+		fmt.Println(authorizeURL)
+	}
+
+	var callbackToken, oauthVerifier string
+	select {
+	case result := <-verifierChan:
+		callbackToken = result[0]
+		oauthVerifier = result[1]
+		_ = callbackToken
+	case <-time.After(5 * time.Minute):
+		return xurlErrors.NewAuthError("Timeout", errors.New("authentication timed out"))
+	}
+
+	// Step 4: Exchange for access token
+	exchangeParams := map[string]string{
+		"oauth_verifier": oauthVerifier,
+	}
+
+	exchangeHeader, err := buildOAuth1AuthHeader("POST", a.oauth1AccessTokenURL, consumerKey, consumerSecret, requestToken, requestTokenSecret, exchangeParams)
+	if err != nil {
+		return xurlErrors.NewAuthError("AccessTokenError", err)
+	}
+
+	exchangeReq, err := http.NewRequest("POST", a.oauth1AccessTokenURL, nil)
+	if err != nil {
+		return xurlErrors.NewAuthError("AccessTokenError", err)
+	}
+	exchangeReq.Header.Set("Authorization", exchangeHeader)
+
+	exchangeResp, err := client.Do(exchangeReq)
+	if err != nil {
+		return xurlErrors.NewAuthError("AccessTokenError", err)
+	}
+	defer exchangeResp.Body.Close()
+
+	if exchangeResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(exchangeResp.Body)
+		return xurlErrors.NewAuthError("AccessTokenError", fmt.Errorf("access token exchange failed with status %d: %s", exchangeResp.StatusCode, string(body)))
+	}
+
+	accessValues, err := parseFormEncodedBody(exchangeResp)
+	if err != nil {
+		return xurlErrors.NewAuthError("AccessTokenError", err)
+	}
+
+	accessToken := accessValues.Get("oauth_token")
+	accessTokenSecret := accessValues.Get("oauth_token_secret")
+
+	if accessToken == "" || accessTokenSecret == "" {
+		return xurlErrors.NewAuthError("AccessTokenError", errors.New("missing oauth_token or oauth_token_secret in access token response"))
+	}
+
+	// Step 5: Save tokens
+	return a.TokenStore.SaveOAuth1Tokens(accessToken, accessTokenSecret, consumerKey, consumerSecret)
+}
+
+// parseFormEncodedBody reads and parses a form-encoded HTTP response body
+func parseFormEncodedBody(resp *http.Response) (url.Values, error) {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, xurlErrors.NewAuthError("IOError", err)
+	}
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		return nil, xurlErrors.NewAuthError("ParseError", err)
+	}
+	return values, nil
 }
 
 func generateSignature(method, urlStr string, params map[string]string, consumerSecret, tokenSecret string) (string, error) {
