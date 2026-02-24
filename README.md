@@ -1,4 +1,4 @@
-# xurl - A curl-like CLI Tool for the X API
+# xurl - A curl-like CLI Tool for the X API.
 
 A command-line tool for interacting with the X (formerly Twitter) API, supporting both OAuth 1.0a and OAuth 2.0 authentication.
 
